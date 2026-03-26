@@ -356,7 +356,9 @@ class GraphitiMemoryStore(BaseMemoryStore):
         lines = []
         for m in messages:
             content = m.get("content", "")
-            if not content:
+            if not content or not isinstance(content, str):
+                continue
+            if m.get("role") not in ("user", "assistant"):
                 continue
             role = m.get("role", "user").capitalize()
             lines.append(f"{role}: {content}")
