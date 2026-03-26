@@ -22,7 +22,9 @@ Reference: https://github.com/getzep/graphiti
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -285,23 +287,38 @@ class GraphitiMemoryStore(BaseMemoryStore):
         self._embedder_cfg = embedder
         self._cross_encoder_cfg = cross_encoder
         self._graphiti: Any = None
-        self._loop: Any = None
         self._initialized = False
+
+        # Persistent event loop for ALL Graphiti async operations.
+        # FalkorDB/Neo4j bind connection pools to the loop at construction
+        # time, so using a single dedicated loop avoids "Future attached to
+        # a different loop" errors caused by sync→async bridging.
+        self._dedicated_loop = asyncio.new_event_loop()
+        self._dedicated_thread = threading.Thread(
+            target=self._dedicated_loop.run_forever,
+            daemon=True,
+            name="graphiti-loop",
+        )
+        self._dedicated_thread.start()
         logger.info("GraphitiMemoryStore created (workspace={})", workspace)
 
-    # ── internal ─────────────────────────────────────────────────────────────
+    # ── dedicated-loop helpers ────────────────────────────────────────────────
+
+    def _run_sync(self, coro: Any, timeout: float = 60) -> Any:
+        """Run *coro* on the dedicated loop, blocking the calling thread."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._dedicated_loop)
+        return future.result(timeout=timeout)
+
+    async def _run_on_dedicated(self, coro: Any, timeout: float = 60) -> Any:
+        """Schedule *coro* on the dedicated loop and ``await`` it from any loop."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._dedicated_loop)
+        return await asyncio.wrap_future(future)
+
+    # ── internal (always runs on the dedicated loop) ─────────────────────────
 
     async def _ensure_graphiti(self) -> None:
-        """Lazily create (or recreate) the Graphiti instance for the current event loop.
-
-        Async graph drivers (FalkorDB / Neo4j) bind connection pools to the
-        event loop active at construction time.  Creating the instance here
-        guarantees it shares the loop used by all subsequent operations.
-        """
-        import asyncio
-        current_loop = asyncio.get_running_loop()
-
-        if self._graphiti is not None and self._loop is current_loop:
+        """Lazily create the Graphiti instance on the dedicated loop."""
+        if self._graphiti is not None:
             return
 
         Graphiti = _lazy_import_graphiti()
@@ -322,12 +339,11 @@ class GraphitiMemoryStore(BaseMemoryStore):
             ),
             **db_kwargs,
         )
-        self._loop = current_loop
         self._initialized = False
-        logger.debug("Graphiti instance created/refreshed for event loop {}", id(current_loop))
+        logger.debug("Graphiti instance created on dedicated loop")
 
     async def _ensure_indices(self) -> None:
-        """Ensure Graphiti instance exists and indices are built (once per loop)."""
+        """Ensure Graphiti instance exists and indices are built (once)."""
         await self._ensure_graphiti()
         if self._initialized:
             return
@@ -355,7 +371,51 @@ class GraphitiMemoryStore(BaseMemoryStore):
             "invalid_at": str(getattr(edge, "invalid_at", "")),
         }
 
-    # ── CRUD ─────────────────────────────────────────────────────────────────
+    # ── CRUD (internal, runs on dedicated loop) ────────────────────────────────
+
+    async def _add_impl(
+        self,
+        messages: list[dict[str, Any]],
+        user_id: str = "default",
+    ) -> Any:
+        await self._ensure_indices()
+        body = self._messages_to_episode_body(messages)
+        if not body:
+            return {}
+        from graphiti_core.nodes import EpisodeType
+        result = await self._graphiti.add_episode(
+            name=f"Conversation ({user_id})",
+            episode_body=body,
+            source_description="nanobot conversation",
+            reference_time=datetime.now(timezone.utc),
+            source=EpisodeType.message,
+            group_id=user_id,
+        )
+        logger.info("Graphiti add_episode done result={}", result)
+        return result
+
+    async def _search_impl(
+        self,
+        query: str,
+        user_id: str = "default",
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        await self._ensure_indices()
+        edges = await self._graphiti.search(
+            query=query,
+            group_ids=[user_id],
+            num_results=limit,
+        )
+        result = [self._edge_to_dict(e) for e in edges]
+        logger.info("Graphiti search success: {} results", len(result))
+        return result
+
+    async def _delete_impl(self, memory_id: str) -> bool:
+        await self._ensure_indices()
+        await self._graphiti.delete_episode(memory_id)
+        return True
+
+    # ── CRUD (public, routes to dedicated loop) ──────────────────────────────
 
     async def add(
         self,
@@ -364,22 +424,8 @@ class GraphitiMemoryStore(BaseMemoryStore):
         **kwargs: Any,
     ) -> Any:
         """Add a conversation episode to the knowledge graph."""
-        await self._ensure_indices()
-        body = self._messages_to_episode_body(messages)
-        if not body:
-            return {}
         try:
-            from graphiti_core.nodes import EpisodeType
-            result = await self._graphiti.add_episode(
-                name=f"Conversation ({user_id})",
-                episode_body=body,
-                source_description="nanobot conversation",
-                reference_time=datetime.now(timezone.utc),
-                source=EpisodeType.message,
-                group_id=user_id,
-            )
-            logger.info("Graphiti add_episode done result={}", result)
-            return result
+            return await self._run_on_dedicated(self._add_impl(messages, user_id))
         except Exception:
             logger.exception("Graphiti add_episode failed")
             raise
@@ -393,14 +439,7 @@ class GraphitiMemoryStore(BaseMemoryStore):
     ) -> list[dict[str, Any]]:
         """Hybrid semantic + keyword search over the knowledge graph."""
         try:
-            edges = await self._graphiti.search(
-                query=query,
-                group_ids=[user_id],
-                num_results=limit,
-            )
-            search_result=[self._edge_to_dict(e) for e in edges]
-            logger.info("search success {}", search_result)
-            return search_result
+            return await self._run_on_dedicated(self._search_impl(query, user_id, limit))
         except Exception:
             logger.exception("Graphiti search failed")
             return []
@@ -423,10 +462,8 @@ class GraphitiMemoryStore(BaseMemoryStore):
 
     async def delete(self, memory_id: str, **kwargs: Any) -> bool:
         """Delete an edge (fact) by UUID."""
-        await self._ensure_indices()
         try:
-            await self._graphiti.delete_episode(memory_id)
-            return True
+            return await self._run_on_dedicated(self._delete_impl(memory_id))
         except Exception:
             logger.exception("Graphiti delete failed for memory_id={}", memory_id)
             return False
@@ -434,20 +471,16 @@ class GraphitiMemoryStore(BaseMemoryStore):
     # ── Agent prompt integration ──────────────────────────────────────────────
 
     def get_memory_context(self, **kwargs: Any) -> str:
-        """Build context string from recent facts (runs synchronously via search)."""
-        import asyncio
+        """Build context string from recent facts.
+
+        Uses the dedicated loop directly (blocking) — safe to call from
+        any thread or from within a running event loop.
+        """
         query = kwargs.get("query", "")
         user_id = kwargs.get("user_id", "default")
         limit = kwargs.get("limit", 10)
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, self.search(query, user_id=user_id, limit=limit))
-                    memories = future.result(timeout=30)
-            else:
-                memories = loop.run_until_complete(self.search(query, user_id=user_id, limit=limit))
+            memories = self._run_sync(self._search_impl(query, user_id=user_id, limit=limit))
             if not memories:
                 return ""
             lines = [f"- {m['memory']}" for m in memories if m.get("memory")]
@@ -463,12 +496,13 @@ class GraphitiMemoryStore(BaseMemoryStore):
         messages: list[dict[str, Any]],
         provider: LLMProvider,
         model: str,
+        user_id: str = "default",
     ) -> bool:
         """Consolidate messages by adding them as a Graphiti episode."""
         if not messages:
             return True
         try:
-            await self.add(messages)
+            await self.add(messages, user_id=user_id)
             self._consecutive_failures = 0
             logger.info("Graphiti consolidation done for {} messages", len(messages))
             return True

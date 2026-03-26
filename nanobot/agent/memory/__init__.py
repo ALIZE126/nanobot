@@ -41,30 +41,15 @@ if TYPE_CHECKING:
 MEMORY_BACKENDS: dict[str, str] = {
     "long_term": "nanobot.agent.memory.long_term_memory.LongTermMemoryStore",
     "mem0": "nanobot.agent.memory.mem0_store.Mem0MemoryStore",
-    "lightmem": "nanobot.agent.memory.light_memory.LightMemoryStore",
-    "a_mem": "nanobot.agent.memory.agentic_memory.AgenticMemoryStore",
-    "simplemem": "nanobot.agent.memory.simple_memory.SimpleMemoryStore",
     "graphiti": "nanobot.agent.memory.graphiti_store.GraphitiMemoryStore",
     "memobase": "nanobot.agent.memory.memobase_store.MemobaseMemoryStore",
 }
 
 _CONFIG_KEY_TO_BACKEND: dict[str, str] = {
     "long_term": "long_term",
-    "longTerm": "long_term",
-    "long_term_memory": "long_term",
     "mem0": "mem0",
-    "lightmem": "lightmem",
-    "light_mem": "lightmem",
-    "lightMem": "lightmem",
-    "a_mem": "a_mem",
-    "aMem": "a_mem",
-    "agentic_memory": "a_mem",
-    "simplemem": "simplemem",
-    "simpleMem": "simplemem",
-    "simple_mem": "simplemem",
     "graphiti": "graphiti",
     "memobase": "memobase",
-    "memoBase": "memobase",
 }
 
 
@@ -127,10 +112,15 @@ def create_memory_store_from_config(
     enabled_backend: str | None = None
     backend_settings: dict[str, Any] = {}
 
-    for attr_name, section in (memory_config.model_extra or {}).items():
+    extra = memory_config.model_extra or {}
+    logger.debug("Memory config model_extra keys: {}", list(extra.keys()))
+
+    for attr_name, section in extra.items():
         if not isinstance(section, dict):
             continue
-        if not section.get("enabled", False):
+        is_enabled = section.get("enabled", False)
+        logger.debug("Memory section '{}': enabled={}", attr_name, is_enabled)
+        if not is_enabled:
             continue
 
         backend_key = _CONFIG_KEY_TO_BACKEND.get(attr_name)
@@ -193,8 +183,10 @@ class MemoryConsolidator:
     def get_lock(self, session_key: str) -> asyncio.Lock:
         return self._locks.setdefault(session_key, asyncio.Lock())
 
-    async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
-        return await self.store.consolidate(messages, self.provider, self.model)
+    async def consolidate_messages(
+        self, messages: list[dict[str, object]], user_id: str = "default"
+    ) -> bool:
+        return await self.store.consolidate(messages, self.provider, self.model, user_id=user_id)
 
     def pick_consolidation_boundary(
         self,
@@ -239,17 +231,55 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
-    async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
+    @property
+    def is_eager_backend(self) -> bool:
+        """External backends (mem0, graphiti, memobase, ...) need per-turn ingestion."""
+        return not isinstance(self.store, LongTermMemoryStore)
+
+    async def ingest_turn(
+        self, turn_messages: list[dict[str, object]], user_id: str = "default"
+    ) -> None:
+        """Extract memories from the latest turn and store them eagerly.
+
+        Only runs for external backends (mem0 / graphiti / memobase).
+        LongTermMemoryStore relies solely on token-based consolidation.
+        """
+        if not self.is_eager_backend or not turn_messages:
+            return
+        clean: list[dict[str, Any]] = []
+        for m in turn_messages:
+            content = m.get("content")
+            role = m.get("role", "")
+            if not content or not isinstance(content, str) or role not in ("user", "assistant"):
+                continue
+            clean.append({"role": role, "content": content})
+        if not clean:
+            return
+        try:
+            await self.store.add(clean, user_id=user_id)
+            logger.info(
+                "Ingested {} turn messages into {} for user={}",
+                len(clean), type(self.store).__name__, user_id,
+            )
+        except Exception:
+            logger.exception("Failed to ingest turn memories for user={}", user_id)
+
+    async def archive_messages(
+        self, messages: list[dict[str, object]], user_id: str = "default"
+    ) -> bool:
         if not messages:
             return True
         for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
-            if await self.consolidate_messages(messages):
+            if await self.consolidate_messages(messages, user_id=user_id):
                 return True
         return True
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
         if not session.messages or self.context_window_tokens <= 0:
             return
+
+        # Derive user_id from session key ("channel:chat_id" → "chat_id")
+        user_id = session.key.split(":", 1)[-1] if ":" in session.key else session.key
 
         lock = self.get_lock(session.key)
         async with lock:
@@ -296,7 +326,7 @@ class MemoryConsolidator:
                     source,
                     len(chunk),
                 )
-                if not await self.consolidate_messages(chunk):
+                if not await self.consolidate_messages(chunk, user_id=user_id):
                     return
                 session.last_consolidated = end_idx
                 self.sessions.save(session)

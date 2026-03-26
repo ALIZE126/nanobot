@@ -331,6 +331,7 @@ class Mem0MemoryStore(BaseMemoryStore):
             if not memories:
                 return ""
             lines = [f"- {m.get('memory', m.get('content', ''))}" for m in memories if m]
+            logger.info("Memory0 get_memory_context:{}", lines)
             return "## Long-term Memory (Mem0)\n" + "\n".join(lines)
         except Exception:
             logger.exception("Mem0 get_memory_context failed")
@@ -341,6 +342,7 @@ class Mem0MemoryStore(BaseMemoryStore):
         messages: list[dict[str, Any]],
         provider: LLMProvider,
         model: str,
+        user_id: str = "default",
     ) -> bool:
         """Consolidate messages by feeding them into Mem0's add pipeline.
 
@@ -363,7 +365,7 @@ class Mem0MemoryStore(BaseMemoryStore):
                 mem0_messages.append({"role": role, "content": content})
 
             if mem0_messages:
-                await self.add(mem0_messages)
+                await self.add(mem0_messages, user_id=user_id)
             self._consecutive_failures = 0
             logger.info("Mem0 consolidation done for {} messages", len(messages))
             return True

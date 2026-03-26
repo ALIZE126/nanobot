@@ -134,6 +134,7 @@ class BaseMemoryStore(ABC):
         messages: list[dict[str, Any]],
         provider: LLMProvider,
         model: str,
+        user_id: str = "default",
     ) -> bool:
         """Consolidate a batch of conversation messages into persistent memory.
 
@@ -144,6 +145,7 @@ class BaseMemoryStore(ABC):
             messages: The message chunk to consolidate.
             provider: LLM provider used for summarization.
             model:    Model identifier.
+            user_id:  Identifier for the user/session scope.
 
         Returns:
             ``True`` when consolidation (or fallback archival) succeeded.

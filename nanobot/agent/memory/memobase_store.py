@@ -306,12 +306,13 @@ class MemobaseMemoryStore(BaseMemoryStore):
         messages: list[dict[str, Any]],
         provider: LLMProvider,
         model: str,
+        user_id: str = "default",
     ) -> bool:
         """Consolidate messages by inserting them into Memobase."""
         if not messages:
             return True
         try:
-            await self.add(messages, sync=False)
+            await self.add(messages, user_id=user_id, sync=False)
             self._consecutive_failures = 0
             logger.info("Memobase consolidation done for {} messages", len(messages))
             return True

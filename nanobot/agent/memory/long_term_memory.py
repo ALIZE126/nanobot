@@ -195,6 +195,7 @@ class LongTermMemoryStore(BaseMemoryStore):
         messages: list[dict[str, Any]],
         provider: LLMProvider,
         model: str,
+        user_id: str = "default",
     ) -> bool:
         if not messages:
             return True

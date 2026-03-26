@@ -84,7 +84,16 @@ class AgentLoop:
         memory_store = None
         if memory_config:
             from nanobot.agent.memory import create_memory_store_from_config
-            memory_store = create_memory_store_from_config(memory_config, workspace)
+            try:
+                memory_store = create_memory_store_from_config(memory_config, workspace)
+                logger.info(
+                    "Memory backend active: {} ({})",
+                    type(memory_store).__name__,
+                    memory_store.__class__.__module__,
+                )
+            except Exception as exc:
+                logger.error("Failed to create memory store, falling back to file-based: {}", exc)
+                memory_store = None
 
         self.context = ContextBuilder(workspace, memory_store=memory_store)
         self.sessions = session_manager or SessionManager(workspace)
@@ -385,8 +394,14 @@ class AgentLoop:
                 current_role=current_role,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history))
+            sys_turn_skip = 1 + len(history)
+            self._save_turn(session, all_msgs, sys_turn_skip)
             self.sessions.save(session)
+            sys_turn = all_msgs[sys_turn_skip:]
+            if sys_turn:
+                self._schedule_background(
+                    self.memory_consolidator.ingest_turn(sys_turn, user_id=chat_id)
+                )
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
@@ -406,7 +421,9 @@ class AgentLoop:
             self.sessions.invalidate(session.key)
 
             if snapshot:
-                self._schedule_background(self.memory_consolidator.archive_messages(snapshot))
+                self._schedule_background(
+                    self.memory_consolidator.archive_messages(snapshot, user_id=msg.chat_id)
+                )
 
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
@@ -451,8 +468,17 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        turn_skip = 1 + len(history)
+        self._save_turn(session, all_msgs, turn_skip)
         self.sessions.save(session)
+
+        # Eagerly ingest this turn's messages for external memory backends
+        turn_messages = all_msgs[turn_skip:]
+        if turn_messages:
+            self._schedule_background(
+                self.memory_consolidator.ingest_turn(turn_messages, user_id=msg.chat_id)
+            )
+
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
