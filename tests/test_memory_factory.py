@@ -64,7 +64,7 @@ class TestBackwardCompatibility:
 class TestMemoryBackendsRegistry:
 
     def test_all_backends_registered(self):
-        expected = {"long_term", "mem0", "lightmem", "a_mem", "simplemem"}
+        expected = {"long_term", "mem0", "graphiti", "memobase"}
         assert set(MEMORY_BACKENDS.keys()) == expected
 
     def test_backend_values_are_importable_paths(self):
@@ -96,17 +96,27 @@ class TestCreateMemoryStore:
             with pytest.raises(ImportError, match="mem0ai"):
                 create_memory_store("mem0", workspace=tmp_path)
 
-    def test_create_lightmem_import_error(self, tmp_path: Path):
-        with pytest.raises(ImportError, match="lightmem"):
-            create_memory_store("lightmem", workspace=tmp_path)
+    def test_create_graphiti_succeeds_with_library(self, tmp_path: Path):
+        store = create_memory_store("graphiti", workspace=tmp_path)
+        from nanobot.agent.memory.graphiti_store import GraphitiMemoryStore
+        assert isinstance(store, GraphitiMemoryStore)
 
-    def test_create_a_mem_import_error(self, tmp_path: Path):
-        with pytest.raises(ImportError, match="agentic_memory"):
-            create_memory_store("a_mem", workspace=tmp_path)
+    def test_create_memobase_succeeds_with_library(self, tmp_path: Path):
+        store = create_memory_store("memobase", workspace=tmp_path)
+        from nanobot.agent.memory.memobase_store import MemobaseMemoryStore
+        assert isinstance(store, MemobaseMemoryStore)
 
-    def test_create_simplemem_import_error(self, tmp_path: Path):
-        with pytest.raises(ImportError, match="simplemem"):
-            create_memory_store("simplemem", workspace=tmp_path)
+    def test_graphiti_lazy_import_fails_without_library(self):
+        from nanobot.agent.memory.graphiti_store import _lazy_import_graphiti
+        with patch.dict("sys.modules", {"graphiti_core": None}):
+            with pytest.raises(ImportError, match="graphiti-core"):
+                _lazy_import_graphiti()
+
+    def test_memobase_lazy_import_fails_without_library(self):
+        from nanobot.agent.memory.memobase_store import _lazy_import_memobase
+        with patch.dict("sys.modules", {"memobase": None, "memobase.core": None, "memobase.core.async_entry": None}):
+            with pytest.raises(ImportError, match="memobase"):
+                _lazy_import_memobase()
 
     def test_create_mem0_with_mock(self, tmp_path: Path):
         mock_mem0_cls = MagicMock()
@@ -214,61 +224,50 @@ class TestCreateMemoryStoreFromConfig:
         from nanobot.agent.memory.mem0_store import Mem0MemoryStore
         assert isinstance(store, Mem0MemoryStore)
 
-    def test_a_mem_enabled_camel_case_keys(self, tmp_path: Path):
-        mock_cls = MagicMock()
+    def test_graphiti_enabled_with_config(self, tmp_path: Path):
         cfg = MemoryConfig.model_validate({
-            "aMem": {
+            "graphiti": {
                 "enabled": True,
-                "embeddingModel": "all-MiniLM-L6-v2",
-                "llmBackend": "openai",
-                "llmModel": "gpt-4o-mini",
+                "graphDb": {
+                    "falkordb": {"enable": True, "host": "localhost", "port": 6380},
+                },
+                "llm": {"model": "gpt-4.1-mini", "apiKey": "sk-x"},
             },
         })
-        with patch(
-            "nanobot.agent.memory.agentic_memory._lazy_import_amem",
-            return_value=mock_cls,
+        with (
+            patch("nanobot.agent.memory.graphiti_store._lazy_import_graphiti", return_value=MagicMock()),
         ):
             store = create_memory_store_from_config(cfg, tmp_path)
-        from nanobot.agent.memory.agentic_memory import AgenticMemoryStore
-        assert isinstance(store, AgenticMemoryStore)
-        mock_cls.assert_called_once_with(
-            model_name="all-MiniLM-L6-v2",
-            llm_backend="openai",
-            llm_model="gpt-4o-mini",
-        )
+        from nanobot.agent.memory.graphiti_store import GraphitiMemoryStore
+        assert isinstance(store, GraphitiMemoryStore)
 
-    def test_simplemem_enabled_camel_to_snake(self, tmp_path: Path):
-        mock_cls = MagicMock()
+    def test_memobase_enabled_with_config(self, tmp_path: Path):
         cfg = MemoryConfig.model_validate({
-            "simplemem": {
+            "memobase": {
                 "enabled": True,
-                "clearDb": True,
-                "enableParallel": True,
-                "maxWorkers": 8,
+                "projectUrl": "http://localhost:8019",
+                "apiKey": "secret",
+                "maxTokenSize": 300,
             },
         })
         with patch(
-            "nanobot.agent.memory.simple_memory._lazy_import_simplemem",
-            return_value=mock_cls,
+            "nanobot.agent.memory.memobase_store._lazy_import_memobase",
+            return_value=(MagicMock(), MagicMock()),
         ):
             store = create_memory_store_from_config(cfg, tmp_path)
-        from nanobot.agent.memory.simple_memory import SimpleMemoryStore
-        assert isinstance(store, SimpleMemoryStore)
-        mock_cls.assert_called_once_with(
-            clear_db=True,
-            enable_parallel_processing=True,
-            max_parallel_workers=8,
-            enable_parallel_retrieval=True,
-            max_retrieval_workers=8,
-        )
+        from nanobot.agent.memory.memobase_store import MemobaseMemoryStore
+        assert isinstance(store, MemobaseMemoryStore)
 
     def test_multiple_enabled_raises_error(self, tmp_path: Path):
         cfg = MemoryConfig.model_validate({
-            "longTerm": {"enabled": True},
+            "long_term": {"enabled": True},
             "mem0": {"enabled": True},
         })
-        with pytest.raises(ValueError, match="Multiple memory backends enabled"):
-            create_memory_store_from_config(cfg, tmp_path)
+        mock_cls = MagicMock()
+        mock_cls.return_value = MagicMock()
+        with patch("nanobot.agent.memory.mem0_store._lazy_import_mem0", return_value=mock_cls):
+            with pytest.raises(ValueError, match="Multiple memory backends enabled"):
+                create_memory_store_from_config(cfg, tmp_path)
 
     def test_unknown_backend_key_warns(self, tmp_path: Path):
         cfg = MemoryConfig.model_validate({
